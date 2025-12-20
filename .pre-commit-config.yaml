@@ -5,28 +5,34 @@ repos:
       - id: end-of-file-fixer
       - id: trailing-whitespace
 
+  # Formatting: mirror ./dev.sh format (ruff format -> black -> isort)
+  - repo: https://github.com/charliermarsh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff-format
+
   - repo: https://github.com/psf/black
     rev: 24.8.0
     hooks:
       - id: black
-
-  - repo: https://github.com/charliermarsh/ruff-pre-commit
-    rev: v0.6.9
-    hooks:
-      - id: ruff
-        args: ["--fix"]
-      - id: ruff-format
 
   - repo: https://github.com/pycqa/isort
     rev: 5.13.2
     hooks:
       - id: isort
 
+  # Linting: mirror ./dev.sh lint-fix (ruff check --fix)
+  - repo: https://github.com/charliermarsh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: ["--fix"]
+
   - repo: local
     hooks:
       - id: mypy
         name: mypy
-        entry: mypy
+        entry: uv run --with mypy mypy
         language: system
         types: [python]
         pass_filenames: false
