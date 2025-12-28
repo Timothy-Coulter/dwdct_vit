@@ -413,6 +413,7 @@ def train_model(config: TrainingConfig) -> Path:
     """Train EfficientNet and return the path to the best checkpoint."""
     torch.manual_seed(config.seed)
     device = config.resolved_device()
+    last_error: PermissionError | None = None
     dataset, num_classes = _materialize_dataset(
         dataset_name=config.dataset,
         data_root=config.data_root,
@@ -431,88 +432,102 @@ def train_model(config: TrainingConfig) -> Path:
         freeze_backbone=config.freeze_backbone,
     )
 
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(
-        trainable_params,
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay,
-    )
-    loss_fn = nn.CrossEntropyLoss()
+    def _build_loaders(worker_count: int) -> tuple[DataLoader, DataLoader]:
+        common = {
+            "batch_size": config.batch_size,
+            "num_workers": worker_count,
+            "pin_memory": device.type == "cuda",
+        }
+        return (
+            DataLoader(train_split, shuffle=True, **common),
+            DataLoader(val_split, shuffle=False, **common),
+        )
 
-    train_loader = DataLoader(
-        train_split,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=config.num_workers,
-        pin_memory=device.type == "cuda",
-    )
-    val_loader = DataLoader(
-        val_split,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=device.type == "cuda",
-    )
-
-    best_acc = -1.0
-    best_path = config.checkpoint_dir / "best.pth"
-    last_path = config.checkpoint_dir / "last.pth"
     writer = SummaryWriter(log_dir=str(config.log_dir))
-    global_step = 0
     try:
-        for epoch in range(config.epochs):
-            epoch_loss = 0.0
-            seen = 0
-            progress = enumerate(train_loader)
-            model.train()
-            for batch_idx, (images, targets) in progress:
-                images = images.to(device)
-                targets = targets.to(device)
-                optimizer.zero_grad()
-                logits = model(images, mode="tensor")
-                loss = loss_fn(logits, targets)
-                loss.backward()
-                optimizer.step()
-                writer.add_scalar("train/loss", float(loss.item()), global_step)
-                batch_size = targets.numel()
-                epoch_loss += float(loss.item()) * batch_size
-                seen += batch_size
-                if batch_idx % 10 == 0:
-                    print(
-                        f"[epoch {epoch + 1}/{config.epochs}] "
-                        f"step {batch_idx + 1}/{len(train_loader)} "
-                        f"loss={loss.item():.4f}"
+        worker_attempts = [config.num_workers] if config.num_workers == 0 else [config.num_workers, 0]
+        for worker_count in worker_attempts:
+            train_loader, val_loader = _build_loaders(worker_count)
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            optimizer = torch.optim.AdamW(
+                trainable_params,
+                lr=config.learning_rate,
+                weight_decay=config.weight_decay,
+            )
+            loss_fn = nn.CrossEntropyLoss()
+            best_acc = -1.0
+            best_path = config.checkpoint_dir / "best.pth"
+            last_path = config.checkpoint_dir / "last.pth"
+            global_step = 0
+
+            try:
+                for epoch in range(config.epochs):
+                    epoch_loss = 0.0
+                    seen = 0
+                    progress = enumerate(train_loader)
+                    model.train()
+                    for batch_idx, (images, targets) in progress:
+                        images = images.to(device)
+                        targets = targets.to(device)
+                        optimizer.zero_grad()
+                        logits = model(images, mode="tensor")
+                        loss = loss_fn(logits, targets)
+                        loss.backward()
+                        optimizer.step()
+                        writer.add_scalar("train/loss", float(loss.item()), global_step)
+                        batch_size = targets.numel()
+                        epoch_loss += float(loss.item()) * batch_size
+                        seen += batch_size
+                        if batch_idx % 10 == 0:
+                            print(
+                                f"[epoch {epoch + 1}/{config.epochs}] "
+                                f"step {batch_idx + 1}/{len(train_loader)} "
+                                f"loss={loss.item():.4f}"
+                            )
+                        global_step += 1
+
+                    val_acc, val_throughput, val_duration = _evaluate(
+                        model=model, loader=val_loader, device=device
                     )
-                global_step += 1
+                    writer.add_scalar("val/accuracy", val_acc, epoch)
+                    writer.add_scalar("val/throughput", val_throughput, epoch)
+                    writer.add_scalar("val/duration_sec", val_duration, epoch)
+                    if seen > 0:
+                        avg_loss = epoch_loss / seen
+                        print(
+                            f"[epoch {epoch + 1}/{config.epochs}] "
+                            f"avg_loss={avg_loss:.4f} val_acc={val_acc:.4f} "
+                            f"val_throughput={val_throughput:.2f}/s"
+                        )
 
-            val_acc, val_throughput, val_duration = _evaluate(
-                model=model, loader=val_loader, device=device
-            )
-            writer.add_scalar("val/accuracy", val_acc, epoch)
-            writer.add_scalar("val/throughput", val_throughput, epoch)
-            writer.add_scalar("val/duration_sec", val_duration, epoch)
-            if seen > 0:
-                avg_loss = epoch_loss / seen
+                    metadata = _build_metadata(
+                        config_dataset=config.dataset,
+                        num_classes=num_classes,
+                        seed=config.seed,
+                    )
+                    _save_checkpoint(model, last_path, metadata)
+                    if val_acc > best_acc:
+                        best_acc = val_acc
+                        _save_checkpoint(model, best_path, metadata)
+                return best_path if best_acc >= 0 else last_path
+            except PermissionError as exc:
+                last_error = exc
+                if worker_count == 0:
+                    raise
                 print(
-                    f"[epoch {epoch + 1}/{config.epochs}] "
-                    f"avg_loss={avg_loss:.4f} val_acc={val_acc:.4f} "
-                    f"val_throughput={val_throughput:.2f}/s"
+                    "DataLoader worker permission error encountered; "
+                    "retrying with num_workers=0. "
+                    f"Original error: {exc}"
                 )
-
-            metadata = _build_metadata(
-                config_dataset=config.dataset,
-                num_classes=num_classes,
-                seed=config.seed,
-            )
-            _save_checkpoint(model, last_path, metadata)
-            if val_acc > best_acc:
-                best_acc = val_acc
-                _save_checkpoint(model, best_path, metadata)
+                continue
     finally:
         writer.flush()
         writer.close()
 
-    return best_path if best_acc >= 0 else last_path
+    if last_error is not None:
+        raise last_error
+
+    return config.checkpoint_dir / "last.pth"
 
 
 def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
