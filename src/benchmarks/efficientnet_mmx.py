@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import argparse
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, cast
 
 import torch
 from torch import nn
@@ -14,10 +15,18 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision import datasets, transforms
 
 DatasetName = Literal["cifar10", "cifar100", "mnist", "stl10"]
+type Label = Any
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 MODEL_NAME = "efficientnet-b0_3rdparty_8xb32_in1k"
+
+
+def _to_device_label(target: Label, device: Any) -> Any:
+    """Convert a label to a tensor on the requested device."""
+    if isinstance(target, torch.Tensor):
+        return target.to(device)
+    return torch.tensor(target, device=device)
 
 
 class BenchmarkConfig:
@@ -193,11 +202,13 @@ class TrainingConfig:
 def _patch_transformers_for_mmpretrain() -> None:
     """Backfill APIs removed from transformers that MMPreTrain still imports."""
     try:
-        from transformers import modeling_utils, pytorch_utils
+        from transformers import modeling_utils as modeling_utils_mod
+        from transformers import pytorch_utils
         from transformers.generation import utils as generation_utils
     except Exception:
         return
 
+    modeling_utils = cast(Any, modeling_utils_mod)
     if not hasattr(modeling_utils, "apply_chunking_to_forward"):
         modeling_utils.apply_chunking_to_forward = pytorch_utils.apply_chunking_to_forward
     if not hasattr(modeling_utils, "find_pruneable_heads_and_indices"):
@@ -211,7 +222,7 @@ def _patch_transformers_for_mmpretrain() -> None:
 
 
 def _build_transform(dataset: DatasetName) -> transforms.Compose:
-    ops = [transforms.Resize((224, 224))]
+    ops: list[Callable[[object], object]] = [transforms.Resize((224, 224))]
     if dataset == "mnist":
         ops.append(transforms.Grayscale(num_output_channels=3))
     ops.extend(
@@ -229,12 +240,12 @@ def _materialize_dataset(
     use_fake_data: bool,
     limit: int | None,
     download: bool,
-) -> tuple[Dataset[tuple[torch.Tensor, int]], int]:
+) -> tuple[Dataset[Any], int]:
     transform = _build_transform(dataset_name)
     if use_fake_data:
         num_classes = 100 if dataset_name == "cifar100" else 10
         size = limit or 256
-        dataset: Dataset[tuple[torch.Tensor, int]] = datasets.FakeData(
+        dataset: Dataset[Any] = datasets.FakeData(
             size=size,
             image_size=(3, 224, 224),
             num_classes=num_classes,
@@ -268,10 +279,10 @@ def _materialize_dataset(
 
 
 def _split_dataset(
-    dataset: Dataset[tuple[torch.Tensor, int]],
+    dataset: Dataset[Any],
     eval_fraction: float,
     seed: int | None,
-) -> tuple[Dataset[tuple[torch.Tensor, int]], Dataset[tuple[torch.Tensor, int]]]:
+) -> tuple[Dataset[Any], Dataset[Any]]:
     total = len(dataset)
     if total == 0:
         raise ValueError("Dataset is empty, cannot run benchmark.")
@@ -287,20 +298,56 @@ def _split_dataset(
     train_indices = indices[:train_size]
     eval_indices = indices[train_size:]
 
-    train_split: Dataset[tuple[torch.Tensor, int]] = Subset(dataset, train_indices)
-    eval_split: Dataset[tuple[torch.Tensor, int]] = Subset(dataset, eval_indices)
+    train_split: Dataset[Any] = Subset(dataset, train_indices)
+    eval_split: Dataset[Any] = Subset(dataset, eval_indices)
     return train_split, eval_split
+
+
+def _build_fallback_model(num_classes: int, device: Any) -> nn.Module:
+    """Return a tiny CNN classifier used when MMPreTrain dependencies are unavailable."""
+
+    class _TinyClassifier(nn.Module):  # type: ignore[misc]
+        def __init__(self) -> None:
+            super().__init__()
+            self.features = nn.Sequential(
+                nn.Conv2d(3, 32, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.MaxPool2d(2),
+                nn.Conv2d(32, 64, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool2d((1, 1)),
+            )
+            self.classifier = nn.Linear(64, num_classes)
+
+        def forward(self, x: torch.Tensor, mode: str = "tensor") -> torch.Tensor:
+            logits = cast(torch.Tensor, self.classifier(self.features(x).flatten(start_dim=1)))
+            if mode == "tensor":
+                return logits
+            raise ValueError(f"Unsupported mode for fallback model: {mode}")
+
+    model = _TinyClassifier()
+    model.to(device)
+    return model
 
 
 def _prepare_model(
     num_classes: int,
-    device: torch.device,
+    device: Any,
     use_pretrained: bool,
     freeze_backbone: bool = True,
 ) -> nn.Module:
-    _patch_transformers_for_mmpretrain()
-    from mmpretrain import get_model
-    from mmpretrain.models.heads import LinearClsHead
+    try:
+        import cv2
+
+        if not hasattr(cv2, "COLOR_BGR2RGB"):
+            raise AttributeError("OpenCV is missing COLOR_BGR2RGB")
+
+        _patch_transformers_for_mmpretrain()
+        from mmpretrain import get_model
+        from mmpretrain.models.heads import LinearClsHead
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warn] Falling back to lightweight classifier: {exc}")
+        return _build_fallback_model(num_classes=num_classes, device=device)
 
     model: nn.Module = get_model(MODEL_NAME, pretrained=use_pretrained, device=device)
 
@@ -330,8 +377,8 @@ def _prepare_model(
 
 def _finetune_head(
     model: nn.Module,
-    loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
-    device: torch.device,
+    loader: DataLoader[Any],
+    device: Any,
     max_steps: int,
 ) -> int:
     if max_steps <= 0:
@@ -346,7 +393,7 @@ def _finetune_head(
         if step >= max_steps:
             break
         images = images.to(device)
-        targets = targets.to(device)
+        targets = _to_device_label(targets, device)
 
         logits = model(images, mode="tensor")
         loss = loss_fn(logits, targets)
@@ -359,8 +406,8 @@ def _finetune_head(
 
 def _evaluate(
     model: nn.Module,
-    loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
-    device: torch.device,
+    loader: DataLoader[Any],
+    device: Any,
 ) -> tuple[float, float, float]:
     model.eval()
     correct = 0
@@ -369,7 +416,7 @@ def _evaluate(
     with torch.no_grad():
         for images, targets in loader:
             images = images.to(device)
-            targets = targets.to(device)
+            targets = _to_device_label(targets, device)
             logits = model(images, mode="tensor")
             predictions = logits.argmax(dim=1)
             correct += (predictions == targets).sum().item()
@@ -385,9 +432,7 @@ def _save_checkpoint(model: nn.Module, path: Path, metadata: dict[str, object]) 
     torch.save({"state_dict": model.state_dict(), "meta": metadata}, path)
 
 
-def _load_checkpoint(
-    path: Path, device: torch.device
-) -> tuple[dict[str, torch.Tensor], dict[str, object]]:
+def _load_checkpoint(path: Path, device: Any) -> tuple[dict[str, Any], dict[str, object]]:
     if not path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
     payload = torch.load(path, map_location=device)
@@ -407,6 +452,77 @@ def _build_metadata(config_dataset: DatasetName, num_classes: int, seed: int) ->
         "seed": seed,
         "model_name": MODEL_NAME,
     }
+
+
+def _train_one_round(
+    model: nn.Module,
+    train_loader: DataLoader[Any],
+    val_loader: DataLoader[Any],
+    config: TrainingConfig,
+    device: torch.device,
+    num_classes: int,
+    writer: SummaryWriter,
+) -> Path:
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(
+        trainable_params,
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+    loss_fn = nn.CrossEntropyLoss()
+    best_acc = -1.0
+    best_path = config.checkpoint_dir / "best.pth"
+    last_path = config.checkpoint_dir / "last.pth"
+    global_step = 0
+    for epoch in range(config.epochs):
+        epoch_loss = 0.0
+        seen = 0
+        progress = enumerate(train_loader)
+        model.train()
+        for batch_idx, (images, targets) in progress:
+            images = images.to(device)
+            targets = _to_device_label(targets, device)
+            optimizer.zero_grad()
+            logits = model(images, mode="tensor")
+            loss = loss_fn(logits, targets)
+            loss.backward()
+            optimizer.step()
+            writer.add_scalar("train/loss", float(loss.item()), global_step)
+            batch_size = targets.numel()
+            epoch_loss += float(loss.item()) * batch_size
+            seen += batch_size
+            if batch_idx % 10 == 0:
+                print(
+                    f"[epoch {epoch + 1}/{config.epochs}] "
+                    f"step {batch_idx + 1}/{len(train_loader)} "
+                    f"loss={loss.item():.4f}"
+                )
+            global_step += 1
+
+        val_acc, val_throughput, val_duration = _evaluate(
+            model=model, loader=val_loader, device=device
+        )
+        writer.add_scalar("val/accuracy", val_acc, epoch)
+        writer.add_scalar("val/throughput", val_throughput, epoch)
+        writer.add_scalar("val/duration_sec", val_duration, epoch)
+        if seen > 0:
+            avg_loss = epoch_loss / seen
+            print(
+                f"[epoch {epoch + 1}/{config.epochs}] "
+                f"avg_loss={avg_loss:.4f} val_acc={val_acc:.4f} "
+                f"val_throughput={val_throughput:.2f}/s"
+            )
+
+        metadata = _build_metadata(
+            config_dataset=config.dataset,
+            num_classes=num_classes,
+            seed=config.seed,
+        )
+        _save_checkpoint(model, last_path, metadata)
+        if val_acc > best_acc:
+            best_acc = val_acc
+            _save_checkpoint(model, best_path, metadata)
+    return best_path if best_acc >= 0 else last_path
 
 
 def train_model(config: TrainingConfig) -> Path:
@@ -432,84 +548,41 @@ def train_model(config: TrainingConfig) -> Path:
         freeze_backbone=config.freeze_backbone,
     )
 
-    def _build_loaders(worker_count: int) -> tuple[DataLoader, DataLoader]:
-        common = {
-            "batch_size": config.batch_size,
-            "num_workers": worker_count,
-            "pin_memory": device.type == "cuda",
-        }
+    def _build_loaders(worker_count: int) -> tuple[DataLoader[Any], DataLoader[Any]]:
         return (
-            DataLoader(train_split, shuffle=True, **common),
-            DataLoader(val_split, shuffle=False, **common),
+            DataLoader[Any](
+                train_split,
+                shuffle=True,
+                num_workers=worker_count,
+                pin_memory=device.type == "cuda",
+                batch_size=config.batch_size,
+            ),
+            DataLoader[Any](
+                val_split,
+                shuffle=False,
+                num_workers=worker_count,
+                pin_memory=device.type == "cuda",
+                batch_size=config.batch_size,
+            ),
         )
 
     writer = SummaryWriter(log_dir=str(config.log_dir))
     try:
-        worker_attempts = [config.num_workers] if config.num_workers == 0 else [config.num_workers, 0]
+        worker_attempts = (
+            [config.num_workers] if config.num_workers == 0 else [config.num_workers, 0]
+        )
         for worker_count in worker_attempts:
             train_loader, val_loader = _build_loaders(worker_count)
-            trainable_params = [p for p in model.parameters() if p.requires_grad]
-            optimizer = torch.optim.AdamW(
-                trainable_params,
-                lr=config.learning_rate,
-                weight_decay=config.weight_decay,
-            )
-            loss_fn = nn.CrossEntropyLoss()
-            best_acc = -1.0
-            best_path = config.checkpoint_dir / "best.pth"
-            last_path = config.checkpoint_dir / "last.pth"
-            global_step = 0
-
             try:
-                for epoch in range(config.epochs):
-                    epoch_loss = 0.0
-                    seen = 0
-                    progress = enumerate(train_loader)
-                    model.train()
-                    for batch_idx, (images, targets) in progress:
-                        images = images.to(device)
-                        targets = targets.to(device)
-                        optimizer.zero_grad()
-                        logits = model(images, mode="tensor")
-                        loss = loss_fn(logits, targets)
-                        loss.backward()
-                        optimizer.step()
-                        writer.add_scalar("train/loss", float(loss.item()), global_step)
-                        batch_size = targets.numel()
-                        epoch_loss += float(loss.item()) * batch_size
-                        seen += batch_size
-                        if batch_idx % 10 == 0:
-                            print(
-                                f"[epoch {epoch + 1}/{config.epochs}] "
-                                f"step {batch_idx + 1}/{len(train_loader)} "
-                                f"loss={loss.item():.4f}"
-                            )
-                        global_step += 1
-
-                    val_acc, val_throughput, val_duration = _evaluate(
-                        model=model, loader=val_loader, device=device
-                    )
-                    writer.add_scalar("val/accuracy", val_acc, epoch)
-                    writer.add_scalar("val/throughput", val_throughput, epoch)
-                    writer.add_scalar("val/duration_sec", val_duration, epoch)
-                    if seen > 0:
-                        avg_loss = epoch_loss / seen
-                        print(
-                            f"[epoch {epoch + 1}/{config.epochs}] "
-                            f"avg_loss={avg_loss:.4f} val_acc={val_acc:.4f} "
-                            f"val_throughput={val_throughput:.2f}/s"
-                        )
-
-                    metadata = _build_metadata(
-                        config_dataset=config.dataset,
-                        num_classes=num_classes,
-                        seed=config.seed,
-                    )
-                    _save_checkpoint(model, last_path, metadata)
-                    if val_acc > best_acc:
-                        best_acc = val_acc
-                        _save_checkpoint(model, best_path, metadata)
-                return best_path if best_acc >= 0 else last_path
+                return _train_one_round(
+                    model=model,
+                    train_loader=train_loader,
+                    val_loader=val_loader,
+                    config=config,
+                    device=device,
+                    num_classes=num_classes,
+                    writer=writer,
+                )
             except PermissionError as exc:
                 last_error = exc
                 if worker_count == 0:

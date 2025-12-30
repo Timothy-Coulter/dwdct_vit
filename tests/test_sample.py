@@ -8,7 +8,7 @@ def test_sample_pass() -> None:
     assert 1 + 1 == 2
 
 
-@pytest.mark.parametrize(  # type: ignore[misc]
+@pytest.mark.parametrize(
     "input,expected",
     [
         (1, 2),

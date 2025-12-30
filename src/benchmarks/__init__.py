@@ -1,6 +1,6 @@
-"""Benchmark utilities for image classification experiments."""
+"""Benchmark exports."""
 
-from .efficientnet_mmx import (
+from src.benchmarks.efficientnet_mmx import (  # noqa: F401
     BenchmarkConfig,
     BenchmarkResult,
     TrainingConfig,
@@ -8,4 +8,10 @@ from .efficientnet_mmx import (
     train_model,
 )
 
-__all__ = ["BenchmarkConfig", "BenchmarkResult", "TrainingConfig", "run_benchmark", "train_model"]
+__all__ = [
+    "BenchmarkConfig",
+    "BenchmarkResult",
+    "TrainingConfig",
+    "run_benchmark",
+    "train_model",
+]

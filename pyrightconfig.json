@@ -1,0 +1,15 @@
+{
+  "typeCheckingMode": "basic",
+  "pythonVersion": "3.12",
+  "stubPath": "typings",
+  "extraPaths": [".", "src", "typings"],
+  "reportMissingModuleSource": "none",
+  "reportInvalidTypeForm": "none",
+  "executionEnvironments": [
+    { "root": "src" },
+    { "root": "tests" },
+    { "root": "unit_tests" },
+    { "root": "examples" },
+    { "root": "misc" }
+  ]
+}
